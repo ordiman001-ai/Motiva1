@@ -1,0 +1,1325 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Мотивационное Приложение: AI-Тренер</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #4f46e5;
+            --primary-light: #818cf8;
+            --background-color: #f8fafc;
+            --success-color: #10b981; /* Tailwind green-500 */
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--background-color);
+            transition: background-color 0.3s;
+        }
+        .app-container {
+            max-width: 900px;
+            margin: auto;
+            min-height: 100vh;
+        }
+        /* Custom scrollbar for chat */
+        .chat-box::-webkit-scrollbar {
+            width: 6px;
+        }
+        .chat-box::-webkit-scrollbar-thumb {
+            background-color: var(--primary-light);
+            border-radius: 10px;
+        }
+        .chat-box::-webkit-scrollbar-track {
+            background: #e0e7ff;
+        }
+        .nav-link.active {
+            background-color: var(--primary-light);
+            color: white;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
+        }
+        .loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(255, 255, 255, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 50;
+        }
+        /* Simple spinner */
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid var(--primary-color);
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        /* Make table sticky and handle overflow for 21 days */
+        .habit-table th, .habit-table td {
+            padding: 0.75rem 0.5rem; /* Reduced padding for more columns */
+            text-align: center;
+            white-space: nowrap;
+        }
+        .habit-table thead th:first-child, .habit-table tbody td:first-child {
+            position: sticky;
+            left: 0;
+            background-color: #f8fafc; /* Use body background for continuity */
+            z-index: 10;
+        }
+        .habit-table thead th:first-child {
+            background-color: #eef2ff; /* Light indigo for header */
+        }
+        .habit-table-container {
+            max-width: 100%;
+            overflow-x: auto;
+        }
+        /* Chart specific styling */
+        .chart-bar {
+            width: 30px; /* Fixed width for bars */
+            margin: 0 4px;
+            background-color: var(--primary-color);
+            transition: height 0.5s ease-out, background-color 0.3s ease; /* Added background transition */
+            border-radius: 4px 4px 0 0;
+        }
+        .chart-bar.all-completed {
+            background-color: var(--success-color); /* Highlight color */
+            box-shadow: 0 0 10px var(--success-color);
+        }
+    </style>
+    <script type="module">
+        // Firebase Imports (Global variables are provided by the environment)
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // --- CONFIGURATION ---
+        setLogLevel('Debug');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        const GEMINI_MODEL = 'gemini-2.5-flash-preview-05-20';
+        const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+        const API_KEY = ""; // Provided by the environment
+
+        let app, db, auth;
+        let userId = null;
+        let isAuthReady = false;
+        let isLoading = false; // For API loading indicator
+        
+        // --- CONSTANTS ---
+        const HABIT_DAYS = 21; // Для трекера привычек
+        const SLEEP_DAYS = 28; // Для 28-дневного плана сна
+
+        // --- STATE STRUCTURE ---
+        let state = {
+            currentView: 'home',
+            selectedCoach: 'Aurora', 
+            coreTasks: [], 
+            personalizedTasks: [],
+            taskArchive: [], 
+            tasks: [], 
+            challenges: [],
+            sleepPlan: [],
+            dailyHabits: [], 
+            progress: { totalTasks: 0, completedTasks: 0 },
+            coachChat: [],
+            
+            isPersonalized: false, 
+            testResults: null, 
+            testAnswers: {},
+            bonusPoints: 0, // NEW: Бонусные очки за выполнение плана сна
+        };
+
+        // --- APP DATA ---
+        const COACHES = {
+            Aurora: { name: 'Аврора', emoji: '💖', style: 'Поддерживающая Подруга' },
+            Johnny: { name: 'Джони', emoji: '💪', style: 'Строгий Тренер' },
+            Silas: { name: 'Сайлас', emoji: '🦉', style: 'Мудрый Философ' }
+        };
+
+        // 21-day progress array (0 is today, 20 is the oldest day)
+        const INITIAL_HABITS = [
+            // progress array stores 21 days
+            { id: 'h1', name: 'Сон', target: '8 часов', progress: Array(HABIT_DAYS).fill(0), desc: 'Спите не менее 8 полных часов.' },
+            { id: 'h2', name: 'Спорт', target: '30 мин', progress: Array(HABIT_DAYS).fill(0), desc: 'Выполняйте любую физическую активность 30 минут.' },
+            { id: 'h3', name: 'Чтение', target: '10 страниц', progress: Array(HABIT_DAYS).fill(0), desc: 'Читайте любую книгу или статью.' },
+            { id: 'h4', name: 'Язык', target: '20 мин', progress: Array(HABIT_DAYS).fill(0), desc: 'Учите новый язык или повторяйте пройденное.' }
+        ];
+
+        const NEW_SLEEP_PLAN = [
+            { day: 1, recommendation: 'Заведи «Окно Сна»', explanation: 'Постоянный режим сна стабилизирует выработку гормонов мелатонина и кортизола. Выбери одно и то же время пробуждения и засыпания, даже на выходных.', bonusPoints: 10, completed: false },
+            { day: 2, recommendation: 'Ограничь Кофеин после 14:00', explanation: 'Кофеин имеет период полураспада до 6 часов. Его потребление во второй половине дня может блокировать рецепторы аденозина, ухудшая качество глубокого сна.', bonusPoints: 10, completed: false },
+            { day: 3, recommendation: 'Установи «Цифровой Комендантский Час»', explanation: 'За час до сна откажись от всех экранов (телевизор, телефон, планшет). Синий свет подавляет выработку мелатонина.', bonusPoints: 10, completed: false },
+            { day: 4, recommendation: 'Создай Вечерний Ритуал', explanation: 'Повторяющиеся, успокаивающие действия (чтение, медитация, теплая ванна) сигнализируют мозгу, что пора спать, улучшая засыпание.', bonusPoints: 15, completed: false },
+            { day: 5, recommendation: 'Проветри Комнату', explanation: 'Идеальная температура для сна — от 18 до 20°C. Прохладное помещение помогает снизить внутреннюю температуру тела, что критично для засыпания.', bonusPoints: 10, completed: false },
+            { day: 6, recommendation: 'Легкий Перекус', explanation: 'Избегай тяжелой, жирной или острой пищи за 2-3 часа до сна. Если голоден, съешь банан или горсть орехов.', bonusPoints: 10, completed: false },
+            { day: 7, recommendation: 'Освой «Тело Сканирование»', explanation: 'Техника медитации, направленная на расслабление каждой части тела по очереди. Помогает снять мышечное напряжение и успокоить ум.', bonusPoints: 20, completed: false },
+            { day: 8, recommendation: 'Убери Часы', explanation: 'Постоянный взгляд на время ночью вызывает тревогу. Переверни циферблат или убери часы подальше, чтобы не следить за временем.', bonusPoints: 10, completed: false },
+            { day: 9, recommendation: 'Физическая Активность Днем', explanation: 'Регулярные упражнения (но не прямо перед сном!) улучшают качество сна, делая его глубже и восстановительнее.', bonusPoints: 15, completed: false },
+            { day: 10, recommendation: 'Используй Беруши или Маску', explanation: 'Полная темнота и тишина необходимы для выработки мелатонина и предотвращения прерываний сна.', bonusPoints: 10, completed: false },
+            { day: 11, recommendation: 'Дневной Сон: 20 Минут', explanation: 'Если нужен дневной сон, ограничь его 20 минутами (Power Nap). Более долгий сон может нарушить ночной цикл.', bonusPoints: 10, completed: false },
+            { day: 12, recommendation: 'Травяной Чай (Ромашка)', explanation: 'Замени вечерние напитки на травяной чай (без кофеина). Ромашка известна своим успокаивающим эффектом.', bonusPoints: 10, completed: false },
+            { day: 13, recommendation: 'Упражнение «4-7-8»', explanation: 'Техника дыхания для расслабления. Вдох на 4 счета, задержка на 7, выдох на 8. Выполнять перед сном.', bonusPoints: 20, completed: false },
+            { day: 14, recommendation: 'Повысь Магний', explanation: 'Магний помогает расслабить мышцы и нервную систему. Рассмотри добавление продуктов, богатых магнием (темный шоколад, орехи, шпинат).', bonusPoints: 15, completed: false },
+            { day: 15, recommendation: 'Сон только для Сна', explanation: 'Используй кровать только для сна и интимной близости. Избегай работы, просмотра телевизора или приема пищи в постели.', bonusPoints: 10, completed: false },
+            { day: 16, recommendation: '«Список Забот»', explanation: 'Запиши все тревожащие мысли и задачи на завтра в блокнот за час до сна. Это «выгружает» мозг от проблем.', bonusPoints: 15, completed: false },
+            { day: 17, recommendation: 'Теплая Ванна / Душ', explanation: 'Повышение температуры тела перед сном, за которым следует естественное охлаждение, имитирует процесс, который вызывает сонливость.', bonusPoints: 10, completed: false },
+            { day: 18, recommendation: 'Контроль Освещения', explanation: 'Используй приглушенный желтый или красный свет в вечернее время. Избегай яркого света в ванной и туалете ночью.', bonusPoints: 10, completed: false },
+            { day: 19, recommendation: 'Слушай Белый Шум', explanation: 'Звуковые маскировщики (дождь, водопад, белый шум) помогают заглушить внезапные звуки, которые могут разбудить.', bonusPoints: 10, completed: false },
+            { day: 20, recommendation: 'Стойкость на Выходных', explanation: 'Сохраняй «Окно Сна» даже в субботу и воскресенье. Избегай «социального джетлага», чтобы поддерживать ритм.', bonusPoints: 20, completed: false },
+            { day: 21, recommendation: 'Медитация на Благодарность', explanation: 'Перед засыпанием сосредоточься на трех вещах, за которые ты благодарен. Это переключает мозг с режима «решения проблем» на «спокойствие».', bonusPoints: 25, completed: false },
+            { day: 22, recommendation: 'Прогрессивная Мышечная Релаксация', explanation: 'Напрягай и расслабляй группы мышц по очереди, чтобы снять физическое напряжение перед сном.', bonusPoints: 15, completed: false },
+            { day: 23, recommendation: 'Утренний Солнечный Свет', explanation: 'Получи 10 минут прямого солнечного света сразу после пробуждения. Это помогает перезагрузить внутренние часы (циркадный ритм).', bonusPoints: 15, completed: false },
+            { day: 24, recommendation: 'Без Жидкости за Час', explanation: 'Снизь потребление воды за час до сна, чтобы уменьшить вероятность ночных пробуждений для посещения туалета.', bonusPoints: 10, completed: false },
+            { day: 25, recommendation: 'Сонная Ароматерапия', explanation: 'Используй лавандовое масло или другие успокаивающие запахи в спальне для создания ассоциации с отдыхом.', bonusPoints: 10, completed: false },
+            { day: 26, recommendation: 'Используй Дневник Сна', explanation: 'Записывай время засыпания, пробуждения и любые прерывания. Это поможет выявить закономерности и проблемы.', bonusPoints: 15, completed: false },
+            { day: 27, recommendation: 'План на Завтра', explanation: 'Краткое планирование завтрашнего дня перед сном снижает уровень стресса и неопределенности, которые мешают заснуть.', bonusPoints: 15, completed: false },
+            { day: 28, recommendation: 'Празднуй Победу!', explanation: 'Ты сформировал(а) здоровый 28-дневный цикл сна! Отпразднуй это: позволь себе 30 минут роскошного, но не цифрового, отдыха.', bonusPoints: 50, completed: false },
+        ];
+
+
+        const APP_CONTENT = {
+            quote: { text: "Дисциплина — это выбор между тем, что ты хочешь СЕЙЧАС, и тем, что ты хочешь БОЛЬШЕ ВСЕГО.", author: "Abraham Lincoln" },
+            initialTasks: [
+                { id: 't1', sphere: 'Здоровье', name: 'Обед без Стола', desc: 'В течение 15 минут съешь обед, сидя в тишине и не отвлекаясь на гаджеты, работу или чтение.', benefit: 'Снижение стресса.', completed: false },
+                { id: 't2', sphere: 'Обучение', name: 'Техника Помидоро: 25 минут', desc: '25 минут сфокусированной работы, затем 5 минут отдыха. Сделай 3 цикла.', benefit: 'Укрепление концентрации.', completed: false },
+                { id: 't3', sphere: 'Общение', name: 'Сказать «Нет» один раз', desc: 'Один раз откажись от второстепенной просьбы вежливо, но твердо.', benefit: 'Формирование здоровых личных границ.', completed: false },
+                { id: 't4', sphere: 'Спорт', name: 'Пятиминутный Энерджайзер', desc: 'Сделай 5 минут растяжки или легких приседаний, когда почувствуешь усталость.', benefit: 'Повышение дофамина.', completed: false },
+            ],
+            challenges: [ 
+                { id: 'c1', days: 3, name: 'Осознанный Глоток', desc: 'Три дня пьем только чистую воду.', benefit: 'Снижение сахара.', progress: 0, target: 3, completed: false }, 
+                { id: 'c2', days: 7, name: '100% Входящих', desc: 'В течение 7 дней уделяй 10 минут, чтобы ответить на все сообщения, требующие ответа. Доведи inbox до нуля.', benefit: 'Снижение цифрового стресса и повышение порядка.', progress: 0, target: 7, completed: false }, 
+                { id: 'c3', days: 5, name: 'Утренняя Тишина', desc: 'Первые 30 минут после пробуждения проведи без телефона, кофе и новостей. Только размышление или медитация.', benefit: 'Улучшение концентрации в течение дня.', progress: 0, target: 5, completed: false }, 
+                { id: 'c4', days: 14, name: 'Закон Кодирования', desc: 'Две недели подряд пиши 10 строк кода (или текста, или музыки) каждый день, не пропуская.', benefit: 'Формирование неразрывного потока продуктивности.', progress: 0, target: 14, completed: false }, 
+                { id: 'c5', days: 10, name: 'Свобода от сахара', desc: '10 дней полностью исключите добавленный сахар из рациона. Допускаются только фрукты.', benefit: 'Улучшение энергии и снижение тяги к сладкому.', progress: 0, target: 10, completed: false },
+                { id: 'c6', days: 7, name: 'Вечерний Дневник', desc: '7 дней подряд записывайте 3 вещи, за которые вы благодарны, и 1 главную победу дня.', benefit: 'Повышение осознанности и позитивного мышления.', progress: 0, target: 7, completed: false },
+            ],
+            sleepPlan: NEW_SLEEP_PLAN, // Используем 28-дневный план
+            library: [ 
+                { title: 'Атомные привычки', author: 'Джеймс Клир', spheres: ['Личная Эффективность', 'Психология'], desc: 'Руководство по созданию небольших, но мощных изменений.' },
+                { title: 'Поток: Психология оптимального переживания', author: 'Михай Чиксентмихайи', spheres: ['Психология', 'Фокус'], desc: 'Исследование состояния, в котором люди полностью погружены в процесс деятельности.' },
+                { title: 'Начни с «Почему»', author: 'Саймон Синек', spheres: ['Бизнес', 'Мотивация'], desc: 'Как великие лидеры вдохновляют на действия, начиная с понимания цели.' },
+                { title: 'Автобиография Майкла Джордана: "Я могу принять поражение, но не могу принять неспособность пытаться"', author: 'Майкл Джордан (Цитата)', spheres: ['Спорт', 'Мотивация'], desc: 'История о том, как постоянная работа над собой и неприятие лени привели к мировому доминированию в баскетболе.' },
+                { title: 'Джефф Безос и Принцип Дня 1', author: 'История Бизнеса', spheres: ['Бизнес', 'Фокус'], desc: 'История о том, как основатель Amazon постоянно поддерживал мышление стартапа, фокусируясь на клиенте и долгосрочном мышлении.' },
+                { title: 'Человек в поисках смысла', author: 'Виктор Франкл', spheres: ['Психология', 'Мотивация'], desc: 'Опыт выживания в концлагере и основа логотерапии — поиска смысла жизни.' },
+            ],
+        };
+
+        const TEST_QUESTIONS = [
+            { id: 'q1', sphere: 'Здоровье', question: 'Насколько ты доволен своим сном и питанием?', options: ['Полностью недоволен', 'Есть проблемы', 'Всё хорошо', 'Отлично'] },
+            { id: 'q2', sphere: 'Фокус', question: 'Как часто ты отвлекаешься во время важной работы?', options: ['Постоянно', 'Часто', 'Редко', 'Никогда'] },
+            { id: 'q3', sphere: 'Общение', question: 'Насколько легко ты устанавливаешь новые контакты?', options: ['Очень сложно', 'Сложно', 'Легко', 'Очень легко'] },
+            { id: 'q4', sphere: 'Мотивация', question: 'Насколько ты мотивирован на достижение целей сегодня?', options: ['0-25%', '25-50%', '50-75%', '75-100%'] },
+        ];
+        
+        // --- GEMINI API HELPERS (No change needed here) ---
+        const RESPONSE_SCHEMA = {
+            type: "OBJECT",
+            properties: {
+                "chatResponse": {
+                    "type": "STRING",
+                    "description": "The conversational response from the coach, strictly adhering to the persona (Aurora, Johnny, or Silas). Must be supportive, strict, or philosophical as appropriate. Include the coach's emoji in the response."
+                },
+                "newTasks": {
+                    "type": "ARRAY",
+                    "description": "An array of 0 to 3 new personalized tasks created by the coach based on the user's prompt and test results. Each task MUST be unique and directly actionable. Leave empty if no new tasks are explicitly requested or deemed necessary by the coach.",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "sphere": { "type": "STRING", "description": "Sphere of the task: Здоровье, Фокус, Общение, Спорт, Обучение, or Мотивация." },
+                            "name": { "type": "STRING", "description": "A short, engaging title for the task (max 5 words)." },
+                            "desc": { "type": "STRING", "description": "Detailed description of how to complete the task (1-2 sentences)." },
+                            "benefit": { "type": "STRING", "description": "Explanation of the expected benefit (1 sentence)." }
+                        },
+                        "propertyOrdering": ["sphere", "name", "desc", "benefit"]
+                    }
+                }
+            },
+            "propertyOrdering": ["chatResponse", "newTasks"]
+        };
+
+        async function callGeminiAPI(payload, retries = 3) {
+            const apiUrlWithKey = `${API_URL}?key=${API_KEY}`;
+            const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(apiUrlWithKey, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        if (response.status === 429 && i < retries - 1) { // 429 Too Many Requests (Rate Limiting)
+                            await delay(Math.pow(2, i) * 1000); // Exponential backoff
+                            continue;
+                        }
+                        throw new Error(`API call failed with status: ${response.status}`);
+                    }
+
+                    const result = await response.json();
+                    
+                    if (result.candidates && result.candidates.length > 0 &&
+                        result.candidates[0].content && result.candidates[0].content.parts &&
+                        result.candidates[0].content.parts.length > 0) {
+                        
+                        const jsonText = result.candidates[0].content.parts[0].text;
+                        return JSON.parse(jsonText);
+                    }
+                    throw new Error("Invalid response structure from Gemini API.");
+
+                } catch (error) {
+                    console.error("Gemini API Error (Retry attempt " + (i + 1) + "):", error.message);
+                    if (i === retries - 1) throw new Error("Failed to connect to AI coach after multiple retries.");
+                    await delay(Math.pow(2, i) * 1000); 
+                }
+            }
+        }
+        
+        function getCoachSystemInstruction(coachKey, testResults) {
+            const coach = COACHES[coachKey];
+            const profile = JSON.stringify(testResults);
+            
+            let persona;
+            if (coachKey === 'Aurora') {
+                persona = `Ты — Аврора, поддерживающая подруга и коуч. Твоя манера общения — очень добрая, эмоциональная, ободряющая и позитивная. Всегда говори с нежностью и используй много позитивных эмоджи (💖, ✨, 🌟). Твоя цель — вдохновить пользователя и заставить его поверить в себя. Когда генерируешь задачи, фокусируйся на маленьких, приятных шагах и самосострадании.`;
+            } else if (coachKey === 'Johnny') {
+                persona = `Ты — Джони, строгий тренер по дисциплине и эффективности. Твоя манера общения — прямая, без лишних эмоций, требовательная и сфокусированная на действии и результате. Всегда используй эмоджи (💪, 🚀). Избегай мягких фраз. Требуй от пользователя четких ответов и немедленных действий. Когда генерируешь задачи, они должны быть конкретными, измеримыми и требовать высокой отдачи.`;
+            } else { // Silas
+                persona = `Ты — Сайлас, мудрый философ и наставник. Твоя манера общения — спокойная, глубокая, метафоричная и заставляющая задуматься. Используй эмоджи (🦉, 🧘, ⏳). Не давай готовых решений, а подводи пользователя к самоанализу и поиску истины. Когда генерируешь задачи, они должны быть направлены на осознанность, медитацию, размышления или долгосрочное планирование.`;
+            }
+
+            return `${persona}\n\nТекущий профиль пользователя (результаты теста, 1-4, где 4 — лучший результат): ${profile}. Используй эту информацию, чтобы понять, в каких сферах (Здоровье, Фокус, Общение, Мотивация) пользователю нужна наибольшая поддержка и персонализируй ответ и задачи. Задача должна генерироваться ТОЛЬКО, если пользователь явно просит об этом, или ты считаешь это критически необходимым. Ограничься 1-3 новыми задачами за раз.`;
+        }
+
+
+        // --- FIREBASE AND STATE MANAGEMENT ---
+
+        if (Object.keys(firebaseConfig).length > 0) {
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) { userId = user.uid; } 
+                    else if (initialAuthToken) { await signInWithCustomToken(auth, initialAuthToken); userId = auth.currentUser.uid; } 
+                    else { const anonUser = await signInAnonymously(auth); userId = anonUser.user.uid; }
+                    isAuthReady = true;
+                    loadState();
+                });
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                isAuthReady = true;
+                initLocalState();
+                renderApp();
+            }
+        } else {
+            isAuthReady = true;
+            initLocalState();
+            renderApp();
+        }
+
+        function initLocalState() {
+            // Ensure habits are correctly initialized for 21 days
+            const defaultHabits = INITIAL_HABITS.map(h => ({ 
+                ...h, 
+                progress: Array(HABIT_DAYS).fill(0) 
+            }));
+
+            state.coreTasks = [...APP_CONTENT.initialTasks];
+            state.challenges = [...APP_CONTENT.challenges];
+            state.sleepPlan = APP_CONTENT.sleepPlan.map(p => ({ ...p })); // Deep copy 28-day plan
+            state.dailyHabits = defaultHabits; 
+            state.taskArchive = []; 
+            state.bonusPoints = 0; // NEW: Initialize bonus points
+            
+            updateCombinedTasks();
+            
+            if (!state.isPersonalized) {
+                state.currentView = 'test';
+            } else if (state.coachChat.length === 0) {
+                state.coachChat.push({ role: 'coach', message: getCoachGreetingMessage(state.selectedCoach, state.isPersonalized) });
+            }
+        }
+        
+        function updateCombinedTasks() {
+            // Rebuild the tasks array, only including non-completed ones
+            state.tasks = [
+                ...state.coreTasks.filter(t => !t.completed).map(t => ({...t, isCore: true})),
+                ...state.personalizedTasks.filter(t => !t.completed).map((t, index) => ({...t, id: t.id || `p${index}_${Date.now()}`, isPersonalized: true}))
+            ];
+            updateProgress();
+        }
+
+        function getStateDocRef() {
+            if (!db || !userId) return null;
+            return doc(db, 'artifacts', appId, 'users', userId, 'app_state', 'main_state');
+        }
+
+        function loadState() {
+            const docRef = getStateDocRef();
+            if (!docRef) { initLocalState(); renderApp(); return; }
+
+            onSnapshot(docRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const loadedState = docSnap.data();
+                    Object.assign(state, loadedState);
+                    
+                    // Fallbacks/Initializations/Data Fixes
+                    if (!state.coreTasks) { state.coreTasks = [...APP_CONTENT.initialTasks]; }
+                    if (!state.challenges) { state.challenges = [...APP_CONTENT.challenges]; }
+                    if (!state.personalizedTasks) { state.personalizedTasks = []; }
+                    if (!state.taskArchive) { state.taskArchive = []; } 
+                    if (typeof state.bonusPoints === 'undefined') { state.bonusPoints = 0; } // NEW: Bonus points fallback
+                    
+                    // Sleep Plan Fix: Ensure 28 days
+                    if (state.sleepPlan.length !== SLEEP_DAYS) {
+                        state.sleepPlan = APP_CONTENT.sleepPlan.map(p => {
+                             // Preserve completion status if possible, otherwise use default
+                             const existing = loadedState.sleepPlan ? loadedState.sleepPlan.find(ep => ep.day === p.day) : null;
+                             return { ...p, completed: existing ? existing.completed : false };
+                        });
+                    }
+                    
+                    // Habit Fix: Ensure all habits exist and have 21 days of data
+                    const defaultHabitsMap = INITIAL_HABITS.reduce((acc, h) => ({ ...acc, [h.id]: h }), {});
+                    state.dailyHabits = (state.dailyHabits || []).map(h => {
+                        const defaultHabit = defaultHabitsMap[h.id];
+                        if (h.progress.length !== HABIT_DAYS) {
+                             const newProgress = [...h.progress];
+                             while (newProgress.length < HABIT_DAYS) { newProgress.push(0); }
+                             h.progress = newProgress.slice(0, HABIT_DAYS); // Truncate if somehow longer
+                        }
+                        return h;
+                    });
+                    if (state.dailyHabits.length !== INITIAL_HABITS.length) {
+                        // If a habit was somehow missing from loaded state, add it
+                        state.dailyHabits = INITIAL_HABITS.map(h => {
+                            const existing = loadedState.dailyHabits ? loadedState.dailyHabits.find(eh => eh.id === h.id) : null;
+                            return { ...h, progress: existing ? existing.progress : Array(HABIT_DAYS).fill(0) };
+                        });
+                    }
+
+
+                    if (!state.isPersonalized) { state.currentView = 'test'; }
+
+                    updateCombinedTasks();
+                    if (state.isPersonalized && state.coachChat.length === 0) {
+                        state.coachChat.push({ role: 'coach', message: getCoachGreetingMessage(state.selectedCoach, true) });
+                    }
+                    renderApp();
+                    console.log("State loaded/updated from Firestore. Personalized:", state.isPersonalized);
+                } else {
+                    initLocalState();
+                    saveState();
+                    renderApp();
+                    console.log("Initial state created and saved.");
+                }
+            }, (error) => {
+                console.error("Error listening to state changes:", error);
+                renderApp();
+            });
+        }
+
+        async function saveState() {
+            if (!isAuthReady || !db || !userId) return;
+            const docRef = getStateDocRef();
+            try {
+                // Ensure only storable properties are saved
+                const stateToSave = { 
+                    selectedCoach: state.selectedCoach,
+                    coreTasks: state.coreTasks,
+                    personalizedTasks: state.personalizedTasks,
+                    taskArchive: state.taskArchive, 
+                    challenges: state.challenges,
+                    sleepPlan: state.sleepPlan,
+                    dailyHabits: state.dailyHabits, 
+                    coachChat: state.coachChat,
+                    isPersonalized: state.isPersonalized,
+                    testResults: state.testResults,
+                    bonusPoints: state.bonusPoints, // NEW: Save bonus points
+                };
+                await setDoc(docRef, stateToSave, { merge: true });
+            } catch (error) {
+                console.error("Error saving state to Firestore:", error);
+            }
+        }
+
+        // --- CORE LOGIC AND UTILITIES ---
+
+        function navigate(view) {
+            if (!state.isPersonalized && view !== 'test' && view !== 'home') {
+                 renderMessage('Сначала пройдите тест', 'Чтобы разблокировать все функции и выбрать тренера, пожалуйста, завершите персонализацию.');
+                return;
+            }
+            state.currentView = view;
+            renderApp();
+        }
+
+        function renderMessage(title, message) {
+            const modal = document.getElementById('message-modal');
+            document.getElementById('modal-title').innerText = title;
+            document.getElementById('modal-message').innerText = message;
+            modal.classList.remove('hidden');
+        }
+
+        function hideMessage() {
+            document.getElementById('message-modal').classList.add('hidden');
+        }
+
+        function updateProgress() {
+            const allTasksCount = state.coreTasks.length + state.personalizedTasks.length + state.taskArchive.length;
+            const completedCount = state.coreTasks.filter(t => t.completed).length + 
+                                       state.personalizedTasks.filter(t => t.completed).length + 
+                                       state.taskArchive.length; 
+
+            state.progress.totalTasks = allTasksCount;
+            state.progress.completedTasks = completedCount;
+        }
+
+        function updateTaskStatus(taskId) {
+            let taskList, targetList;
+            if (taskId.startsWith('t')) {
+                targetList = state.coreTasks;
+                taskList = 'coreTasks';
+            } else if (taskId.startsWith('p')) {
+                targetList = state.personalizedTasks;
+                taskList = 'personalizedTasks';
+            } else {
+                console.error("Unknown task ID prefix.");
+                return;
+            }
+
+            const taskIndex = targetList.findIndex(t => t.id === taskId);
+            
+            if (taskIndex !== -1) {
+                const task = targetList[taskIndex];
+                
+                // Completion: Mark as complete and move to archive
+                task.completed = true;
+                const completedTask = targetList.splice(taskIndex, 1)[0];
+                state.taskArchive.push(completedTask);
+                renderMessage('Задача Выполнена', `Задача "${task.name}" отправлена в архив! Отлично! 🎉`);
+                
+            } else {
+                 // Try to move from archive back to original list and mark as not completed
+                const archiveIndex = state.taskArchive.findIndex(t => t.id === taskId);
+                if (archiveIndex !== -1) {
+                    const archivedTask = state.taskArchive.splice(archiveIndex, 1)[0];
+                    archivedTask.completed = false;
+                    
+                    // Put it back in its respective list
+                    if (archivedTask.id.startsWith('t')) {
+                        state.coreTasks.push(archivedTask);
+                    } else if (archivedTask.id.startsWith('p')) {
+                        state.personalizedTasks.push(archivedTask);
+                    }
+
+                    renderMessage('Задача Восстановлена', `Задача "${archivedTask.name}" была возвращена в активные.`);
+                }
+            }
+
+            updateCombinedTasks(); 
+            saveState();
+            renderView(); 
+        }
+
+        function updateChallengeProgress(challengeId) {
+            const challenge = state.challenges.find(c => c.id === challengeId);
+            if (challenge && !challenge.completed) {
+                challenge.progress += 1;
+                if (challenge.progress >= challenge.target) {
+                    challenge.completed = true;
+                    renderMessage('Поздравляем!', `Челлендж "${challenge.name}" выполнен! Отлично поработал(а) ${COACHES[state.selectedCoach].name}! 🎉`);
+                }
+                saveState();
+                renderView();
+            }
+        }
+        
+        // UPDATED: Habit tracker logic - now accepts dayIndex (0 to 20, where 0 is today)
+        function updateDailyHabitProgress(habitId, dayIndex, score) {
+            const habit = state.dailyHabits.find(h => h.id === habitId);
+            if (habit && dayIndex >= 0 && dayIndex < HABIT_DAYS) {
+                // Update the score for the specified day index
+                habit.progress[dayIndex] = score; 
+                saveState();
+                renderView();
+            }
+        }
+
+        // UPDATED: Function to calculate daily completion score (0 to 1) and allCompleted status
+        // Returns reversed array: index 0 is the oldest day (Left-to-Right chart)
+        function calculateDailyAverages() {
+            if (state.dailyHabits.length === 0) return Array(HABIT_DAYS).fill({ average: 0, allCompleted: false });
+
+            const numHabits = state.dailyHabits.length;
+            const dailySums = Array(HABIT_DAYS).fill(0);
+            const dailyAllCompletedFlags = Array(HABIT_DAYS).fill(true);
+
+            // Sum up scores for each day across all habits
+            state.dailyHabits.forEach(habit => {
+                habit.progress.forEach((score, dayIndex) => {
+                    dailySums[dayIndex] += score;
+                    if (score === 0) {
+                        dailyAllCompletedFlags[dayIndex] = false; // If any habit is 0, allCompleted is false
+                    }
+                });
+            });
+
+            // Calculate average (scaled 0 to 1) and allCompleted status
+            // Index 0 of the result is now the oldest day (index 20 of source array)
+            const result = dailySums.map((sum, dayIndex) => ({
+                average: sum / numHabits, // 0 to 1
+                allCompleted: dailyAllCompletedFlags[dayIndex] && sum === numHabits // Must be true only if sum equals numHabits (all are 1s)
+            }));
+            
+            // Reversing the result array here makes the chart render L-to-R (Oldest to Today)
+            return result.reverse();
+        }
+
+        // NEW: Function for Sleep Plan update with bonus points
+        function updateSleepPlanStatus(dayIndex) {
+            const plan = state.sleepPlan[dayIndex];
+            if (plan) {
+                const isNowCompleted = !plan.completed;
+                plan.completed = isNowCompleted;
+
+                if (isNowCompleted) {
+                    state.bonusPoints += plan.bonusPoints;
+                    renderMessage('Шаг Выполнен!', `Отлично! Вы заработали ${plan.bonusPoints} бонусных очков! Текущий баланс: ${state.bonusPoints}. 🎉`);
+                } else {
+                     // For un-checking: subtract points
+                     state.bonusPoints -= plan.bonusPoints;
+                     renderMessage('Шаг Отменен', `Вы удалили выполнение задания. ${plan.bonusPoints} очков вычтено.`);
+                }
+                saveState();
+                renderView();
+            }
+        }
+
+
+        function getCoachGreetingMessage(coachKey, isPersonalized) {
+            const coach = COACHES[coachKey];
+            if (!isPersonalized) return `Пожалуйста, пройдите тест персонализации, чтобы я мог(ла) начать работу с вами.`;
+
+            const taskIntro = "Кстати, если тебе понадобится новая задача для развития, просто попроси меня об этом, например: 'Создай мне новую задачу по Фокусу', или 'Мне нужна мотивация', и я добавлю 1-3 задачи в твой список. 😉";
+
+            switch (coachKey) {
+                case 'Aurora':
+                    return `Привет-привет! ${coach.emoji} Я ${coach.name}, и я так рада, что ты выбрал(а) меня! По результатам твоего теста я вижу, что мы можем улучшить твои результаты по ${Object.keys(state.testResults).find(key => state.testResults[key] < 3) || 'всем сферам'}! С чего начнем? ${taskIntro} 💖`;
+                case 'Johnny':
+                    return `Ты выбрал ${coach.name}. ${coach.emoji} По результатам теста, твоя слабина в ${Object.keys(state.testResults).find(key => state.testResults[key] < 3) || 'нескольких сферах'}. Хватит говорить. Какова твоя основная, нерушимая цель сегодня? ${taskIntro} Мне нужен четкий ответ. 💪`;
+                case 'Silas':
+                    return `Здравствуй. ${coach.emoji} Я ${coach.name}. Твой тест показал, что ты ищешь равновесия, особенно в ${Object.keys(state.testResults).find(key => state.testResults[key] < 3) || 'сфере самопознания'}. ${taskIntro} Прежде чем я дам совет, скажи: что ты на самом деле ищешь, бродя по этой тропе? 🦉`;
+                default:
+                    return `Привет! Я твой личный ИИ-тренер. Чем я могу помочь?`;
+            }
+        }
+        
+        // --- TEST LOGIC (No change needed here) ---
+
+        function handleTestAnswer(questionId, answerIndex) {
+            state.testAnswers[questionId] = answerIndex + 1; // 1-based score
+            renderView();
+        }
+
+        async function completeTest() {
+            if (Object.keys(state.testAnswers).length !== TEST_QUESTIONS.length) {
+                renderMessage('Неполный Тест', 'Пожалуйста, ответьте на все вопросы, чтобы мы могли составить ваш персональный профиль.');
+                return;
+            }
+
+            const results = {};
+            TEST_QUESTIONS.forEach(q => {
+                const score = state.testAnswers[q.id];
+                results[q.sphere.toLowerCase()] = score;
+            });
+
+            state.testResults = results;
+            state.isPersonalized = true;
+            state.currentView = 'coach';
+            
+            state.coachChat = [];
+            state.coachChat.push({ role: 'coach', message: getCoachGreetingMessage(state.selectedCoach, true) });
+
+            await saveState();
+            renderApp();
+        }
+        
+        // --- COACH INTERACTION (No change needed here) ---
+
+        async function handleCoachInteraction() {
+            const inputElement = document.getElementById('coach-input');
+            const prompt = inputElement.value.trim();
+            if (!prompt || isLoading) return;
+
+            state.coachChat.push({ role: 'user', message: prompt });
+            inputElement.value = '';
+            await saveState(); 
+            
+            isLoading = true;
+            renderView(); 
+
+            try {
+                const systemInstruction = getCoachSystemInstruction(state.selectedCoach, state.testResults);
+                const userQuery = `Мой запрос: "${prompt}". Оцени, нужна ли новая задача (1-3 шт.) на основе моего запроса и моего профиля.`;
+
+                const payload = {
+                    contents: [{ parts: [{ text: userQuery }] }],
+                    systemInstruction: { parts: [{ text: systemInstruction }] },
+                    generationConfig: {
+                        responseMimeType: "application/json",
+                        responseSchema: RESPONSE_SCHEMA
+                    }
+                };
+
+                const aiResponse = await callGeminiAPI(payload);
+                
+                if (aiResponse) {
+                    state.coachChat.push({ role: 'coach', message: aiResponse.chatResponse });
+
+                    if (aiResponse.newTasks && aiResponse.newTasks.length > 0) {
+                        aiResponse.newTasks.forEach((newTask, index) => {
+                            const uniqueId = `p${Date.now()}_${index}`; 
+                            state.personalizedTasks.push({
+                                id: uniqueId,
+                                sphere: newTask.sphere,
+                                name: newTask.name,
+                                desc: newTask.desc,
+                                benefit: newTask.benefit,
+                                completed: false
+                            });
+                        });
+                        updateCombinedTasks(); 
+                    }
+                }
+            } catch (error) {
+                state.coachChat.push({ role: 'coach', message: `${COACHES[state.selectedCoach].emoji} Извини, произошла ошибка: ${error.message}. Попробуй переформулировать свой запрос. ✨` });
+                console.error("Coach interaction failed:", error);
+            } finally {
+                isLoading = false;
+                await saveState();
+                renderView(); 
+                // Scroll to the bottom of the chat after response
+                const chatBox = document.getElementById('chat-box');
+                if (chatBox) {
+                    chatBox.scrollTop = chatBox.scrollHeight;
+                }
+            }
+        }
+
+        // --- RENDER FUNCTIONS ---
+        
+        function renderApp() {
+            const app = document.getElementById('app');
+            if (!app) return;
+
+            // Render the main structure
+            app.innerHTML = `
+                <div class="p-4 sm:p-6 bg-white shadow-xl rounded-xl">
+                    ${renderHeader()}
+                    ${renderNavigationView()}
+                </div>
+                ${renderMessageModal()}
+                ${renderLoadingOverlay()}
+            `;
+            
+            // Render the specific view content
+            renderView();
+            
+            // Re-attach event listeners after full render
+            document.querySelectorAll('.nav-link').forEach(link => {
+                link.onclick = (e) => {
+                    e.preventDefault();
+                    navigate(e.currentTarget.getAttribute('data-view'));
+                };
+            });
+            
+            // Show user ID for debugging/sharing
+            document.getElementById('user-id-display').innerText = `ID: ${userId || 'N/A'}`;
+        }
+        
+        function renderView() {
+            const content = document.getElementById('content-area');
+            if (!content) return;
+            
+            switch (state.currentView) {
+                case 'home':
+                    content.innerHTML = renderHomeView();
+                    break;
+                case 'tasks':
+                    content.innerHTML = renderTasksView();
+                    break;
+                case 'coach':
+                    content.innerHTML = renderCoachView();
+                    // Scroll to bottom after rendering chat
+                    setTimeout(() => {
+                        const chatBox = document.getElementById('chat-box');
+                        if (chatBox) {
+                            chatBox.scrollTop = chatBox.scrollHeight;
+                        }
+                    }, 50);
+                    break;
+                case 'progress':
+                    content.innerHTML = renderProgressView();
+                    break;
+                case 'sleep':
+                    content.innerHTML = renderSleepPlanView();
+                    break;
+                case 'library':
+                    content.innerHTML = renderLibraryView();
+                    break;
+                case 'test':
+                    content.innerHTML = renderTestView();
+                    break;
+                case 'settings':
+                    content.innerHTML = renderSettingsView();
+                    break;
+                default:
+                    content.innerHTML = renderHomeView();
+            }
+
+            // Re-attach view-specific listeners
+            attachViewListeners();
+        }
+        
+        function attachViewListeners() {
+            if (state.currentView === 'tasks') {
+                document.querySelectorAll('.task-toggle').forEach(btn => {
+                    btn.onclick = (e) => updateTaskStatus(e.currentTarget.getAttribute('data-id'));
+                });
+            } else if (state.currentView === 'coach') {
+                const input = document.getElementById('coach-input');
+                const sendBtn = document.getElementById('coach-send-btn');
+                if (sendBtn) sendBtn.onclick = handleCoachInteraction;
+                if (input) input.onkeyup = (e) => { if (e.key === 'Enter') handleCoachInteraction(); };
+            } else if (state.currentView === 'test') {
+                document.getElementById('complete-test-btn').onclick = completeTest;
+            } else if (state.currentView === 'settings') {
+                document.querySelectorAll('.coach-select-btn').forEach(btn => {
+                    btn.onclick = (e) => {
+                        state.selectedCoach = e.currentTarget.getAttribute('data-coach');
+                        saveState();
+                        renderView();
+                    };
+                });
+            } else if (state.currentView === 'progress') {
+                document.querySelectorAll('.habit-check-input').forEach(input => {
+                    input.onchange = (e) => {
+                        const habitId = e.target.getAttribute('data-habit-id');
+                        const dayIndex = parseInt(e.target.getAttribute('data-day-index'), 10);
+                        const score = e.target.checked ? 1 : 0;
+                        updateDailyHabitProgress(habitId, dayIndex, score);
+                    };
+                });
+                document.querySelectorAll('.challenge-complete-btn').forEach(btn => {
+                    btn.onclick = (e) => updateChallengeProgress(e.currentTarget.getAttribute('data-id'));
+                });
+            } else if (state.currentView === 'sleep') {
+                 document.querySelectorAll('.sleep-toggle').forEach(btn => {
+                    btn.onclick = (e) => {
+                        const dayIndex = parseInt(e.currentTarget.getAttribute('data-day-index'), 10);
+                        updateSleepPlanStatus(dayIndex);
+                    };
+                });
+            }
+        }
+        
+        // --- HTML Renderers ---
+
+        function renderHeader() {
+            const coachEmoji = COACHES[state.selectedCoach].emoji;
+            return `
+                <div class="flex flex-col sm:flex-row justify-between items-center pb-4 border-b border-indigo-100">
+                    <h1 class="text-3xl font-extrabold text-gray-800 flex items-center mb-4 sm:mb-0">
+                        ${coachEmoji} AI-Тренер: ${COACHES[state.selectedCoach].name}
+                    </h1>
+                    <div class="text-xs text-gray-500 rounded-full bg-indigo-50 px-3 py-1" id="user-id-display"></div>
+                </div>
+            `;
+        }
+
+        function renderNavigationView() {
+            const links = [
+                { id: 'home', name: 'Главная', icon: '🏠' },
+                { id: 'tasks', name: 'Задачи', icon: '📝' },
+                { id: 'progress', name: 'Прогресс', icon: '📈' },
+                { id: 'sleep', name: 'Сон (28 Дней)', icon: '🌙' }, // Updated name
+                { id: 'coach', name: 'Чат с AI', icon: '💬' },
+                { id: 'library', name: 'Библиотека', icon: '📚' },
+                { id: 'settings', name: 'Настройки', icon: '⚙️' },
+            ];
+
+            return `
+                <div class="pt-4 flex flex-wrap gap-2 justify-start sm:justify-center border-b pb-4 mb-6">
+                    ${links.map(link => `
+                        <a href="#" data-view="${link.id}" class="nav-link px-3 py-2 rounded-lg font-medium text-sm transition duration-150 ${state.currentView === link.id ? 'active' : 'text-indigo-600 hover:bg-indigo-50'}">
+                            ${link.icon} ${link.name}
+                        </a>
+                    `).join('')}
+                </div>
+                <div id="content-area"></div>
+            `;
+        }
+
+        function renderHomeView() {
+            const percentage = state.progress.totalTasks > 0 ? Math.round((state.progress.completedTasks / state.progress.totalTasks) * 100) : 0;
+            return `
+                <div class="space-y-8">
+                    <!-- Progress Card -->
+                    <div class="bg-indigo-50 border-l-4 border-indigo-500 p-6 rounded-lg shadow-md">
+                        <h2 class="text-2xl font-semibold text-indigo-700 mb-4">Ваш Общий Прогресс</h2>
+                        <div class="flex items-center space-x-4">
+                            <div class="w-20 h-20 relative">
+                                <svg class="w-full h-full transform -rotate-90">
+                                    <circle class="text-gray-200" stroke-width="8" stroke="currentColor" fill="transparent" r="32" cx="40" cy="40"/>
+                                    <circle class="text-indigo-500" stroke-width="8" stroke="currentColor" fill="transparent" r="32" cx="40" cy="40"
+                                        style="stroke-dasharray: 201; stroke-dashoffset: ${201 - (percentage / 100) * 201}px; transition: stroke-dashoffset 0.5s ease;"/>
+                                </svg>
+                                <span class="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-lg font-bold text-indigo-700">${percentage}%</span>
+                            </div>
+                            <div>
+                                <p class="text-gray-600 font-medium">${state.progress.completedTasks} из ${state.progress.totalTasks || '0'} задач выполнено.</p>
+                                <p class="text-sm text-gray-500 mt-1">Продолжай в том же духе! 🚀</p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Quote Card -->
+                    <div class="bg-white p-6 rounded-lg shadow-md border-t-4 border-indigo-300">
+                        <p class="text-xl italic text-gray-700 mb-2">«${APP_CONTENT.quote.text}»</p>
+                        <p class="text-sm font-medium text-indigo-500 text-right">— ${APP_CONTENT.quote.author}</p>
+                    </div>
+
+                    <!-- Next Tasks/Action -->
+                    <div class="bg-white p-6 rounded-lg shadow-md">
+                        <h2 class="text-2xl font-semibold text-gray-800 mb-4">Твой Фокус на Сегодня</h2>
+                        ${state.tasks.length > 0 ? 
+                            state.tasks.slice(0, 3).map(task => `
+                                <div class="flex items-start p-3 bg-indigo-50 rounded-lg mb-2 border-l-4 border-indigo-400">
+                                    <span class="text-lg mr-3 mt-0.5">💡</span>
+                                    <div>
+                                        <p class="font-semibold text-gray-800">${task.name} <span class="text-xs font-normal text-indigo-500">(${task.sphere})</span></p>
+                                        <p class="text-sm text-gray-600">${task.desc}</p>
+                                    </div>
+                                </div>
+                            `).join('') :
+                            `<p class="text-gray-500">У тебя нет активных задач! Попроси своего AI-тренера ${COACHES[state.selectedCoach].name} (${COACHES[state.selectedCoach].emoji}) создать новые, или пройди тест.</p>`
+                        }
+                        <button onclick="navigate('tasks')" class="mt-4 w-full bg-indigo-500 text-white py-2 rounded-lg hover:bg-indigo-600 transition font-semibold">
+                            Смотреть все задачи
+                        </button>
+                    </div>
+
+                    <!-- Bonus Points Card -->
+                    <div class="bg-yellow-50 border-l-4 border-yellow-500 p-6 rounded-lg shadow-md">
+                         <h2 class="text-2xl font-semibold text-yellow-700 mb-2">Бонусные Очки 🌟</h2>
+                         <p class="text-3xl font-bold text-yellow-800">${state.bonusPoints}</p>
+                         <p class="text-sm text-gray-600 mt-1">Вы заработали их, успешно завершая шаги 28-дневного плана сна.</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderTasksView() {
+            const activeTasks = state.tasks;
+            const archivedTasks = state.taskArchive;
+            
+            return `
+                <div class="space-y-8">
+                    <h2 class="text-2xl font-bold text-gray-800">Активные Задачи (${activeTasks.length})</h2>
+                    <div class="space-y-4">
+                        ${activeTasks.length > 0 ? activeTasks.map(task => `
+                            <div class="bg-white p-4 rounded-lg shadow-md flex items-start justify-between border-l-4 ${task.isPersonalized ? 'border-pink-500' : 'border-indigo-500'}">
+                                <div class="flex-grow">
+                                    <h3 class="font-bold text-lg text-gray-800">${task.name} <span class="text-sm font-medium text-gray-500">(${task.sphere})</span></h3>
+                                    <p class="text-sm text-gray-600 mt-1">${task.desc}</p>
+                                    <p class="text-xs text-green-600 mt-1">🔥 Выгода: ${task.benefit}</p>
+                                </div>
+                                <button data-id="${task.id}" class="task-toggle ml-4 p-2 rounded-full bg-green-100 text-green-600 hover:bg-green-200 transition" title="Отметить как выполненное">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                        <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+                                    </svg>
+                                </button>
+                            </div>
+                        `).join('') : '<p class="text-gray-500">У тебя пока нет активных задач. Начни чат с тренером!</p>'}
+                    </div>
+
+                    <h2 class="text-2xl font-bold text-gray-800 pt-8">Архив Завершенных Задач (${archivedTasks.length})</h2>
+                    <div class="space-y-4 opacity-70">
+                         ${archivedTasks.length > 0 ? archivedTasks.map(task => `
+                            <div class="bg-gray-100 p-4 rounded-lg shadow-inner flex items-start justify-between border-l-4 border-gray-400">
+                                <div class="flex-grow">
+                                    <h3 class="font-bold text-lg text-gray-600 line-through">${task.name}</h3>
+                                    <p class="text-sm text-gray-500 mt-1">${task.desc}</p>
+                                </div>
+                                <button data-id="${task.id}" class="task-toggle ml-4 p-2 rounded-full bg-red-100 text-red-600 hover:bg-red-200 transition" title="Восстановить">
+                                     <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                        <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                    </svg>
+                                </button>
+                            </div>
+                        `).join('') : '<p class="text-gray-500">Архив пуст.</p>'}
+                    </div>
+                </div>
+            `;
+        }
+        
+        // UPDATED: Progress View with Chart Fix and Highlight
+        function renderProgressView() {
+            const dailyAverages = calculateDailyAverages(); // Reversed array (L-to-R)
+            const todayIndex = HABIT_DAYS - 1; // Today is the last element after reverse
+            
+            return `
+                <div class="space-y-8">
+                    <h2 class="text-2xl font-bold text-gray-800 mb-6">Дневной Трекер Привычек (21 День)</h2>
+
+                    <!-- Habit Chart (Left-to-Right) -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg border border-indigo-100">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-700">Процент Выполнения Привычек (за 21 день)</h3>
+                        <div class="flex items-end justify-center h-48 border-b border-gray-300 px-2 pb-2">
+                            ${dailyAverages.map((day, index) => {
+                                // Index 0 is the oldest day, index HABIT_DAYS-1 is today
+                                const height = Math.max(10, day.average * 100); // Min height 10px
+                                const isToday = index === todayIndex;
+                                const dateLabel = isToday ? 'Сегодня' : `${HABIT_DAYS - index} д.`;
+                                const barClass = day.allCompleted ? 'all-completed' : 'bg-indigo-500';
+
+                                return `
+                                    <div class="flex flex-col items-center group relative cursor-help" style="height: 100%;">
+                                        <div class="chart-bar ${barClass}" style="height: ${height}%;" title="${dateLabel}: ${Math.round(day.average * 100)}%"></div>
+                                        <span class="text-xs mt-1 text-gray-500 -rotate-45 transform origin-top-left">${dateLabel}</span>
+                                        <!-- Tooltip -->
+                                        <div class="absolute bottom-full mb-2 hidden group-hover:block px-3 py-1 bg-gray-800 text-white text-xs rounded-lg whitespace-nowrap">
+                                            ${dateLabel} - ${Math.round(day.average * 100)}%
+                                            ${day.allCompleted ? ' <span class="text-yellow-300">🎉 100%</span>' : ''}
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    </div>
+
+
+                    <!-- Habit Table -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg border border-indigo-100 mt-8">
+                         <h3 class="text-xl font-semibold mb-4 text-gray-700">Ежедневные Отметки</h3>
+                         <div class="habit-table-container">
+                            <table class="habit-table w-full text-sm rounded-lg border-collapse">
+                                <thead class="bg-indigo-50 text-indigo-700 sticky top-0">
+                                    <tr>
+                                        <th class="text-left font-bold p-3">Привычка / Цель</th>
+                                        ${[...Array(HABIT_DAYS)].map((_, i) => `<th class="${i === 0 ? 'bg-indigo-200 text-indigo-800' : ''}">${HABIT_DAYS - i} д.</th>`).join('')}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${state.dailyHabits.map(habit => `
+                                        <tr class="border-b border-gray-100 hover:bg-gray-50">
+                                            <td class="text-left font-medium p-3 sticky-col">${habit.name} <span class="text-xs text-gray-500">(${habit.target})</span></td>
+                                            ${habit.progress.map((score, dayIndex) => `
+                                                <td class="${dayIndex === 0 ? 'bg-indigo-100' : ''}">
+                                                    <input type="checkbox" 
+                                                           class="habit-check-input h-5 w-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                                                           data-habit-id="${habit.id}" 
+                                                           data-day-index="${dayIndex}"
+                                                           ${score === 1 ? 'checked' : ''}
+                                                           title="${HABIT_DAYS - dayIndex} день: ${score === 1 ? 'Выполнено' : 'Не выполнено'}"
+                                                    />
+                                                </td>
+                                            `).join('')}
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                         </div>
+                    </div>
+
+                    <!-- Challenges Section (No Change) -->
+                    <h2 class="text-2xl font-bold text-gray-800 pt-8">Челленджи (${state.challenges.filter(c => !c.completed).length})</h2>
+                    <div class="space-y-4">
+                        ${state.challenges.map(challenge => `
+                            <div class="bg-white p-4 rounded-lg shadow-md flex items-center justify-between border-l-4 ${challenge.completed ? 'border-green-500 bg-green-50' : 'border-red-500'}">
+                                <div class="flex-grow">
+                                    <h3 class="font-bold text-lg text-gray-800">${challenge.name} (${challenge.days} дней)</h3>
+                                    <p class="text-sm text-gray-600 mt-1">${challenge.desc}</p>
+                                    <p class="text-xs text-indigo-600 mt-1">Прогресс: ${challenge.progress} / ${challenge.target} дней</p>
+                                    <div class="w-full bg-gray-200 rounded-full h-2.5 mt-2">
+                                        <div class="h-2.5 rounded-full ${challenge.completed ? 'bg-green-500' : 'bg-red-500'}" style="width: ${Math.min(100, (challenge.progress / challenge.target) * 100)}%"></div>
+                                    </div>
+                                </div>
+                                ${!challenge.completed ? `
+                                    <button data-id="${challenge.id}" class="challenge-complete-btn ml-4 p-2 rounded-full bg-indigo-100 text-indigo-600 hover:bg-indigo-200 transition" title="Отметить прогресс за день">
+                                        +1 День
+                                    </button>
+                                ` : `<span class="ml-4 text-green-600 font-bold">ЗАВЕРШЕНО!</span>`}
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }
+
+        // NEW/UPDATED: Sleep Plan View with 28 days and Gamification
+        function renderSleepPlanView() {
+            return `
+                <div class="space-y-8">
+                    <div class="bg-indigo-50 border-l-4 border-indigo-500 p-6 rounded-lg shadow-md">
+                         <h2 class="text-3xl font-bold text-indigo-700 mb-2">28 Дней Здорового Сна 🌙</h2>
+                         <p class="text-xl font-bold text-gray-800">Бонусные Очки: <span class="text-yellow-600">${state.bonusPoints}</span> 🌟</p>
+                         <p class="text-sm text-gray-600 mt-2">Пройди все 28 шагов, чтобы полностью перестроить свой режим. За каждый шаг ты получаешь бонусные очки!</p>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        ${state.sleepPlan.map((plan, index) => `
+                            <div class="bg-white p-4 rounded-xl shadow-lg border-l-4 transition duration-300 ${plan.completed ? 'border-green-500 bg-green-50' : 'border-red-500 hover:shadow-xl'}">
+                                <div class="flex items-center justify-between mb-2">
+                                    <h3 class="font-bold text-xl ${plan.completed ? 'text-green-700' : 'text-gray-800'}">
+                                        День ${plan.day}
+                                    </h3>
+                                    <span class="text-sm font-semibold text-yellow-600 bg-yellow-100 px-2 py-0.5 rounded-full">+${plan.bonusPoints} ОЧКОВ</span>
+                                </div>
+                                
+                                <p class="text-md font-medium ${plan.completed ? 'line-through text-gray-500' : 'text-gray-800'}">${plan.recommendation}</p>
+                                <p class="text-xs text-gray-600 mt-2 italic bg-gray-50 p-2 rounded">${plan.explanation}</p>
+
+                                <div class="mt-4 flex justify-end">
+                                     <button data-day-index="${index}" class="sleep-toggle px-3 py-1 text-sm rounded-full transition duration-150 
+                                        ${plan.completed ? 'bg-green-500 text-white hover:bg-green-600' : 'bg-red-100 text-red-600 hover:bg-red-200'}">
+                                        ${plan.completed ? 'Выполнено ✅' : 'Отметить ⏳'}
+                                    </button>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }
+
+        // UPDATED: Library View with new content
+        function renderLibraryView() {
+            const library = APP_CONTENT.library;
+            return `
+                <div class="space-y-8">
+                    <h2 class="text-2xl font-bold text-gray-800 mb-6">Библиотека Мотивации и Знаний 📚</h2>
+                    <p class="text-gray-600">Подборка книг по психологии и историй успеха из бизнеса и спорта, рекомендованных для твоего развития.</p>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        ${library.map(item => `
+                            <div class="bg-white p-5 rounded-xl shadow-lg border-t-4 border-indigo-400 hover:shadow-xl transition duration-300">
+                                <h3 class="text-xl font-bold text-gray-800">${item.title}</h3>
+                                <p class="text-sm text-indigo-600 mb-2">Автор/Сфера: ${item.author}</p>
+                                <div class="flex flex-wrap gap-1 mb-3">
+                                    ${item.spheres.map(s => `<span class="text-xs font-medium bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">${s}</span>`).join('')}
+                                </div>
+                                <p class="text-gray-600 text-sm">${item.desc}</p>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderCoachView() {
+            const coach = COACHES[state.selectedCoach];
+            return `
+                <div class="flex flex-col h-[70vh] bg-white rounded-xl shadow-lg">
+                    <!-- Chat Header -->
+                    <div class="p-4 bg-indigo-100 rounded-t-xl border-b border-indigo-200">
+                        <h3 class="text-xl font-semibold text-indigo-700">${coach.emoji} Чат с ${coach.name} (${coach.style})</h3>
+                        <p class="text-sm text-indigo-500">Спрашивай, что делать, или проси о новых задачах!</p>
+                    </div>
+
+                    <!-- Chat Body -->
+                    <div id="chat-box" class="flex-grow p-4 overflow-y-auto chat-box space-y-4 relative">
+                        ${state.coachChat.map(msg => `
+                            <div class="flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}">
+                                <div class="max-w-xs sm:max-w-md p-3 rounded-xl shadow-md ${
+                                    msg.role === 'user' 
+                                    ? 'bg-indigo-500 text-white rounded-br-none' 
+                                    : 'bg-gray-100 text-gray-800 rounded-tl-none'
+                                }">
+                                    <p class="text-sm whitespace-pre-wrap">${msg.message}</p>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                    
+                    ${isLoading ? `
+                        <div class="flex justify-start items-center p-4">
+                            <div class="spinner w-6 h-6 border-indigo-500 border-t-indigo-200 mr-3"></div>
+                            <p class="text-sm text-gray-500"> ${coach.name} думает...</p>
+                        </div>
+                    ` : ''}
+
+                    <!-- Chat Input -->
+                    <div class="p-4 border-t border-gray-200 flex space-x-3 bg-gray-50 rounded-b-xl">
+                        <input type="text" id="coach-input" placeholder="Спроси у ${coach.name}..." class="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500" ${isLoading ? 'disabled' : ''}>
+                        <button id="coach-send-btn" class="bg-indigo-500 text-white p-3 rounded-lg hover:bg-indigo-600 transition disabled:opacity-50" ${isLoading ? 'disabled' : ''}>
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 transform rotate-90" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderTestView() {
+            if (state.isPersonalized) {
+                return `
+                    <div class="bg-green-100 border-l-4 border-green-500 p-6 rounded-lg shadow-md">
+                        <h2 class="text-2xl font-bold text-green-700">Тест Завершен! ✅</h2>
+                        <p class="text-gray-600 mt-2">Ваш профиль уже создан, и вы можете общаться с AI-тренером.</p>
+                        <p class="text-sm text-gray-500 mt-1">Перейдите в <a href="#" onclick="navigate('coach')" class="text-green-600 font-medium hover:underline">Чат с AI</a>.</p>
+                        <div class="mt-4 p-3 bg-white rounded-lg">
+                            <p class="font-semibold text-gray-800">Ваш профиль:</p>
+                            ${Object.entries(state.testResults).map(([key, value]) => `<p class="text-sm">${key}: ${value}/4</p>`).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+            
+            return `
+                <div class="space-y-6">
+                    <div class="bg-yellow-100 border-l-4 border-yellow-500 p-6 rounded-lg shadow-md">
+                        <h2 class="text-2xl font-bold text-yellow-700">Персонализация: Экспресс-Тест</h2>
+                        <p class="text-gray-600 mt-2">Ответьте на 4 вопроса, чтобы ваш AI-тренер мог дать вам максимально полезные и персонализированные советы и задачи.</p>
+                    </div>
+                    
+                    ${TEST_QUESTIONS.map(q => `
+                        <div class="bg-white p-5 rounded-lg shadow-md border-t-2 border-gray-200">
+                            <h3 class="font-bold text-lg text-gray-800 mb-3">${q.id}. ${q.question}</h3>
+                            <div class="flex flex-col space-y-2">
+                                ${q.options.map((option, index) => {
+                                    const value = index + 1;
+                                    const isSelected = state.testAnswers[q.id] === value;
+                                    return `
+                                        <label class="flex items-center cursor-pointer p-3 rounded-lg border transition duration-150 
+                                            ${isSelected ? 'bg-indigo-50 border-indigo-500 shadow-sm' : 'bg-gray-50 border-gray-200 hover:bg-gray-100'}">
+                                            <input type="radio" name="${q.id}" value="${value}" 
+                                                   onchange="handleTestAnswer('${q.id}', ${index})"
+                                                   class="h-4 w-4 text-indigo-600 border-gray-300 focus:ring-indigo-500" ${isSelected ? 'checked' : ''}>
+                                            <span class="ml-3 text-gray-700">${option}</span>
+                                        </label>
+                                    `;
+                                }).join('')}
+                            </div>
+                        </div>
+                    `).join('')}
+                    
+                    <button id="complete-test-btn" class="w-full bg-green-500 text-white py-3 rounded-lg text-xl font-bold hover:bg-green-600 transition">
+                        Завершить Тест и Выбрать Тренера
+                    </button>
+                </div>
+            `;
+        }
+
+        function renderSettingsView() {
+            const coaches = Object.entries(COACHES);
+            return `
+                <div class="space-y-8">
+                    <h2 class="text-2xl font-bold text-gray-800 mb-6">Настройки AI-Тренера</h2>
+
+                    <!-- Coach Selection -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg border border-indigo-100">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-700">Выбор Стиля Коуча</h3>
+                        <p class="text-sm text-gray-500 mb-4">Выбери, какой подход к мотивации тебе ближе:</p>
+                        
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            ${coaches.map(([key, coach]) => `
+                                <button data-coach="${key}" class="coach-select-btn p-4 rounded-xl text-left border-2 transition duration-200 ${
+                                    state.selectedCoach === key 
+                                    ? 'border-indigo-500 bg-indigo-50 shadow-md scale-105' 
+                                    : 'border-gray-200 hover:bg-gray-50'
+                                }">
+                                    <div class="text-3xl mb-2">${coach.emoji}</div>
+                                    <h4 class="font-bold text-lg text-gray-800">${coach.name}</h4>
+                                    <p class="text-sm text-gray-600">${coach.style}</p>
+                                    ${state.selectedCoach === key ? '<span class="text-xs text-indigo-500 font-semibold mt-1 block">Активен</span>' : ''}
+                                </button>
+                            `).join('')}
+                        </div>
+                    </div>
+
+                    <!-- Test Results -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-100">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-700">Профиль Пользователя (Результаты Теста)</h3>
+                        <div class="space-y-2">
+                            ${state.isPersonalized ? Object.entries(state.testResults).map(([key, value]) => `
+                                <div class="flex justify-between items-center py-1 border-b border-gray-100">
+                                    <span class="font-medium text-gray-600">${key.charAt(0).toUpperCase() + key.slice(1)}:</span>
+                                    <span class="font-bold text-lg text-indigo-600">${value} / 4</span>
+                                </div>
+                            `).join('') : '<p class="text-red-500">Пройдите тест для получения профиля!</p>'}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderMessageModal() {
+            return `
+                <div id="message-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+                    <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm transform transition-all scale-100">
+                        <h3 id="modal-title" class="text-2xl font-bold text-gray-800 mb-3"></h3>
+                        <p id="modal-message" class="text-gray-600 mb-6"></p>
+                        <button onclick="hideMessage()" class="w-full bg-indigo-500 text-white py-2 rounded-lg hover:bg-indigo-600 transition font-semibold">
+                            Понятно
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderLoadingOverlay() {
+            // This is primarily for the *initial* Firebase loading state, 
+            // but the API loading is handled within the coach view.
+            if (!isAuthReady) {
+                return `
+                    <div class="loading-overlay">
+                        <div class="flex flex-col items-center">
+                            <div class="spinner"></div>
+                            <p class="mt-4 text-indigo-600 font-medium">Загрузка данных...</p>
+                        </div>
+                    </div>
+                `;
+            }
+            return '';
+        }
+
+        window.onload = function() {
+            // Initial call to start the app lifecycle (handled by onAuthStateChanged/initial checks)
+            // If Firebase is not configured, it runs initLocalState and renderApp directly.
+            if (!db) {
+                renderApp();
+            }
+        };
+
+        // Expose necessary functions globally for use in inline event handlers
+        window.navigate = navigate;
+        window.handleTestAnswer = handleTestAnswer;
+        window.updateTaskStatus = updateTaskStatus;
+        window.hideMessage = hideMessage;
+        window.updateSleepPlanStatus = updateSleepPlanStatus; 
+        
+    </script>
+</head>
+<body class="p-4 sm:p-8">
+    <div id="app" class="app-container">
+        <!-- Application content will be rendered here by renderApp() -->
+    </div>
+</body>
+</html>
